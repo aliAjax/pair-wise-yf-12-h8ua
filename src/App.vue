@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import EmergencyDesk from "./emergency/EmergencyDesk.vue";
+import { bindStationRecords } from "./emergency/status";
 
 type Field = {
   key: string;
@@ -62,8 +64,23 @@ const project = {
     },
     {
       "key": "stock",
-      "label": "库存摘要L",
+      "label": "当前库存L",
       "type": "number"
+    },
+    {
+      "key": "floorStock",
+      "label": "保底库存L",
+      "type": "number"
+    },
+    {
+      "key": "fuel",
+      "label": "经营油品",
+      "type": "select",
+      "options": [
+        "92#汽油",
+        "95#汽油",
+        "0#柴油"
+      ]
     },
     {
       "key": "manager",
@@ -75,6 +92,8 @@ const project = {
       "station": "东区一站",
       "area": "东区",
       "stock": 36000,
+      "floorStock": 8000,
+      "fuel": "92#汽油",
       "manager": "刘站长",
       "status": "营业中",
       "notes": "库存正常"
@@ -83,9 +102,31 @@ const project = {
       "station": "机场快线站",
       "area": "机场线",
       "stock": 9000,
+      "floorStock": 3000,
+      "fuel": "0#柴油",
       "manager": "王站长",
       "status": "库存紧张",
       "notes": "柴油待补"
+    },
+    {
+      "station": "西区南环站",
+      "area": "西区",
+      "stock": 24000,
+      "floorStock": 6000,
+      "fuel": "0#柴油",
+      "manager": "赵站长",
+      "status": "营业中",
+      "notes": "保供对接站"
+    },
+    {
+      "station": "机场保障站",
+      "area": "机场线",
+      "stock": 15000,
+      "floorStock": 4000,
+      "fuel": "95#汽油",
+      "manager": "陈站长",
+      "status": "营业中",
+      "notes": "机场专线保障"
     }
   ],
   "metricLabels": [
@@ -102,6 +143,18 @@ function createBlank() {
   return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
 }
 
+function normalize(record: RecordItem): RecordItem {
+  // 老数据没有油品/保底库存字段时补齐默认值，避免应急台读到空油品
+  return {
+    ...record,
+    fuel: typeof record.fuel === "string" && record.fuel !== "" ? record.fuel : "92#汽油",
+    floorStock:
+      typeof record.floorStock === "number" && Number.isFinite(record.floorStock)
+        ? record.floorStock
+        : 0
+  };
+}
+
 function loadRecords(): RecordItem[] {
   const raw = localStorage.getItem(project.storageKey);
   if (!raw) {
@@ -112,7 +165,8 @@ function loadRecords(): RecordItem[] {
     })) as RecordItem[];
   }
   try {
-    return JSON.parse(raw) as RecordItem[];
+    const parsed = JSON.parse(raw);
+    return (Array.isArray(parsed) ? (parsed as RecordItem[]) : []).map(normalize);
   } catch {
     return [];
   }
@@ -122,6 +176,19 @@ const records = ref<RecordItem[]>(loadRecords());
 const form = reactive<Record<string, string | number>>(createBlank());
 const note = ref("");
 const filter = ref(project.filters[0]);
+const view = ref<"stations" | "emergency">("stations");
+
+// 应急保供核销台复用油站主数据：绑定读取与库存扣减两条通道
+bindStationRecords(
+  () => records.value,
+  (stationId, liters) => {
+    const target = records.value.find((record) => record.id === stationId);
+    if (!target) return;
+    const next = Math.max(0, Number(target.stock || 0) - liters);
+    target.stock = next;
+    persist();
+  }
+);
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
@@ -132,11 +199,11 @@ const metrics = computed(() => {
   const total = records.value.length;
   const second = records.value.filter((record) => record.status === statuses[1]).length;
   const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
+  const stockSum = records.value.reduce(
+    (acc, record) => acc + (Number(record.stock || 0) || 0),
+    0
   );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
+  return [total, second || stockSum, third || Math.round(stockSum / Math.max(total, 1))];
 });
 
 const chartRows = computed(() => statuses.map((status) => ({
@@ -202,69 +269,90 @@ function remove(id: string) {
         </div>
       </header>
 
-      <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
-        </article>
-      </section>
+      <nav class="view-tabs">
+        <button
+          type="button"
+          :class="{ active: view === 'stations' }"
+          @click="view = 'stations'"
+        >
+          油站网点
+        </button>
+        <button
+          type="button"
+          :class="{ active: view === 'emergency' }"
+          @click="view = 'emergency'"
+        >
+          应急保供核销台
+        </button>
+      </nav>
 
-      <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
-
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
-          </div>
-
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
-            </div>
-          </div>
+      <template v-if="view === 'stations'">
+        <section class="metrics">
+          <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
+            <span>{{ label }}</span>
+            <strong>{{ metrics[index] }}</strong>
+          </article>
         </section>
-      </section>
+
+        <section class="workspace">
+          <form class="panel" @submit.prevent="submit">
+            <h2>{{ project.formTitle }}</h2>
+            <div class="form-grid">
+              <label v-for="field in fields" :key="field.key">
+                {{ field.label }}
+                <select v-if="field.type === 'select'" v-model="form[field.key]" required>
+                  <option value="">请选择</option>
+                  <option v-for="option in field.options" :key="option">{{ option }}</option>
+                </select>
+                <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
+              </label>
+              <label>
+                备注
+                <textarea v-model="note" placeholder="填写处理说明或现场备注" />
+              </label>
+              <button type="submit">{{ project.primaryAction }}</button>
+            </div>
+          </form>
+
+          <section class="list-panel">
+            <div class="toolbar">
+              <h2>{{ project.entityLabel }}列表</h2>
+              <select v-model="filter">
+                <option v-for="item in project.filters" :key="item">{{ item }}</option>
+              </select>
+            </div>
+
+            <div class="record-grid">
+              <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
+              <article v-for="record in filteredRecords" :key="record.id" class="record">
+                <div class="record-head">
+                  <p class="record-title">{{ primaryText(record) }}</p>
+                  <span class="status">{{ record.status }}</span>
+                </div>
+                <div class="details">
+                  <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
+                </div>
+                <p class="note">{{ record.notes }}</p>
+                <div class="actions">
+                  <button type="button" @click="flow(record)">流转状态</button>
+                  <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
+                  <button class="danger" type="button" @click="remove(record.id)">删除</button>
+                </div>
+              </article>
+            </div>
+
+            <div class="mini-chart">
+              <div v-for="row in chartRows" :key="row.status" class="bar">
+                <span>{{ row.status }}</span>
+                <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
+                <strong>{{ row.value }}</strong>
+              </div>
+            </div>
+          </section>
+        </section>
+      </template>
+
+      <EmergencyDesk v-else />
     </div>
   </main>
 </template>
