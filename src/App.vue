@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import EmergencyDesk from "./emergency/EmergencyDesk.vue";
 
 type Field = {
   key: string;
@@ -265,6 +266,8 @@ function remove(id: string) {
           </div>
         </section>
       </section>
+
+      <EmergencyDesk />
     </div>
   </main>
 </template>
